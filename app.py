@@ -763,6 +763,24 @@ HTML_TEMPLATE = """
             fetch('/jersey', { method: 'POST', body: fd }).catch(() => {});
         }
 
+        // Keep the on-screen order matching the server's rule: goalkeepers
+        // first, then outfielders alphabetically by name. Without this, a
+        // drag/swap just appends to the end of the list and the GK can
+        // end up buried. Shared by both the drag handler and the
+        // dropdown fallback below.
+        function sortSquadList(listEl) {
+            const players = Array.from(listEl.querySelectorAll('.squad-player'));
+            players.sort((a, b) => {
+                const aGk = a.dataset.gk === 'true';
+                const bGk = b.dataset.gk === 'true';
+                if (aGk !== bGk) return aGk ? -1 : 1;
+                const aName = a.querySelector('.player-name').innerText.trim().toLowerCase();
+                const bName = b.querySelector('.player-name').innerText.trim().toLowerCase();
+                return aName.localeCompare(bName);
+            });
+            players.forEach(p => listEl.appendChild(p));
+        }
+
         // --- Drag-and-drop team swapping (results page) ---
         // Uses pointer events (not native HTML5 DnD) so this works the
         // same way with mouse, touch, and pen input.
@@ -806,6 +824,7 @@ HTML_TEMPLATE = """
                 const fromIdx = fromList.dataset.teamIdx;
                 const toIdx = targetList.dataset.teamIdx;
                 targetList.appendChild(playerEl);
+                sortSquadList(targetList);
                 recalcTeam(fromIdx);
                 recalcTeam(toIdx);
                 persistSwap(playerEl.dataset.playerId, toIdx);
@@ -890,6 +909,7 @@ HTML_TEMPLATE = """
             const fromList = playerEl.closest('.squad-list');
             const fromIdx = fromList.dataset.teamIdx;
             targetList.appendChild(playerEl);
+            sortSquadList(targetList);
 
             const recalc = (idx) => {
                 const list = grid.querySelector('.squad-list[data-team-idx="' + idx + '"]');

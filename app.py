@@ -326,16 +326,32 @@ HTML_TEMPLATE = """
             background: var(--paper); border-radius: 8px;
             box-shadow: 0 10px 22px rgba(0,0,0,0.2); overflow: hidden;
             display: flex; flex-direction: column; justify-content: space-between;
+            border-top: 6px solid var(--team-color, var(--pitch-dark));
         }
 
         .squad-card-header {
             background: var(--pitch-dark); padding: 12px 16px;
             display: flex; justify-content: space-between; align-items: center;
+            gap: 10px;
         }
         .squad-card-header h3 {
             margin: 0; font-family: 'Teko', sans-serif; font-size: 1.3rem; font-weight: 700;
             color: var(--paper); letter-spacing: 0.5px;
+            display: flex; align-items: center; gap: 8px;
         }
+
+        .jersey-dot {
+            width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0;
+            border: 2px solid rgba(255,255,255,0.5);
+            box-shadow: inset 0 1px 2px rgba(0,0,0,0.25);
+        }
+
+        .jersey-select {
+            font-family: 'Inter', sans-serif; font-size: 0.68rem; font-weight: 700;
+            padding: 3px 6px; border-radius: 4px; border: 1.5px solid rgba(255,255,255,0.25);
+            background: rgba(255,255,255,0.08); color: var(--paper); cursor: pointer;
+        }
+        .jersey-select option { color: #1A1A1A; }
 
         .stat-tag {
             font-size: 0.7rem; font-weight: 800; color: var(--pitch-dark);
@@ -527,11 +543,22 @@ HTML_TEMPLATE = """
         <div class="squad-grid" id="squad-grid">
             {% for squad in teams %}
             {% set this_team_idx = loop.index0 %}
-            <div class="squad-card">
+            {% set jersey = jersey_colors[this_team_idx] if this_team_idx < jersey_colors|length else None %}
+            <div class="squad-card" id="card-{{ this_team_idx }}" style="--team-color: {{ jersey.hex if jersey else 'var(--pitch-dark)' }};">
                 <div>
                     <div class="squad-card-header">
-                        <h3>Team {{ loop.index }}</h3>
-                        <span class="stat-tag" id="rating-{{ this_team_idx }}">Rating {{ squad.total_skill }}</span>
+                        <h3>
+                            <span class="jersey-dot" id="dot-{{ this_team_idx }}" style="background:{{ jersey.hex if jersey else 'transparent' }};"></span>
+                            Team {{ loop.index }}
+                        </h3>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <select class="jersey-select" id="jersey-select-{{ this_team_idx }}" onchange="changeJersey({{ this_team_idx }}, this.value)">
+                                {% for jc in jersey_choices %}
+                                <option value="{{ jc.key }}" {% if jersey and jersey.key == jc.key %}selected{% endif %}>{{ jc.name }}</option>
+                                {% endfor %}
+                            </select>
+                            <span class="stat-tag" id="rating-{{ this_team_idx }}">Rating {{ squad.total_skill }}</span>
+                        </div>
                     </div>
                     <div class="squad-list" data-team-idx="{{ this_team_idx }}">
                         {% for p in squad.players %}
@@ -567,7 +594,6 @@ HTML_TEMPLATE = """
             </form>
             <a href="/" class="btn btn-ghost">← Edit check-in list</a>
         </div>
-
 
 
         {% elif view == 'login' %}
@@ -719,6 +745,22 @@ HTML_TEMPLATE = """
                 const name = row.getElementsByClassName('p-name')[0].innerText.toLowerCase();
                 row.style.display = name.includes(query) ? "flex" : "none";
             }
+        }
+
+        // --- Jersey color selection (results page) ---
+        const JERSEY_HEX = {{ (jersey_hex_map if jersey_hex_map is defined else {})|tojson }};
+
+        function changeJersey(teamIdx, colorKey) {
+            const card = document.getElementById('card-' + teamIdx);
+            const dot = document.getElementById('dot-' + teamIdx);
+            const hex = JERSEY_HEX[colorKey] || 'transparent';
+            if (card) card.style.setProperty('--team-color', hex);
+            if (dot) dot.style.background = hex;
+
+            const fd = new FormData();
+            fd.append('team_idx', teamIdx);
+            fd.append('color_key', colorKey);
+            fetch('/jersey', { method: 'POST', body: fd }).catch(() => {});
         }
 
         // --- Drag-and-drop team swapping (results page) ---
@@ -874,6 +916,36 @@ HTML_TEMPLATE = """
 
 REQUIRED_PLAYERS_BY_FORMAT = {2: 10, 3: 15}
 
+# Jersey color palette: default order is Team 1 = Red, Team 2 = Yellow,
+# Team 3 = Blue. Swappable per-team via the dropdown on the results page.
+JERSEY_CHOICES = [
+    {"key": "red", "name": "Red", "hex": "#C0392B"},
+    {"key": "yellow", "name": "Yellow", "hex": "#D4A017"},
+    {"key": "blue", "name": "Blue", "hex": "#2C5BA0"},
+    {"key": "white", "name": "White", "hex": "#E8E6DA"},
+    {"key": "black", "name": "Black", "hex": "#2B2B2B"},
+]
+JERSEY_HEX_MAP = {jc["key"]: jc["hex"] for jc in JERSEY_CHOICES}
+JERSEY_BY_KEY = {jc["key"]: jc for jc in JERSEY_CHOICES}
+DEFAULT_JERSEY_ORDER = ["red", "yellow", "blue"]
+
+def default_jersey_keys(num_teams):
+    return [DEFAULT_JERSEY_ORDER[i] for i in range(num_teams)]
+
+def get_jersey_keys(num_teams):
+    """Read the current per-team jersey color keys from session, falling
+    back to the default Red/Yellow/Blue order if not yet customized or
+    if the team count changed since the colors were last set."""
+    keys = session.get('jersey_keys')
+    if not keys or len(keys) != num_teams:
+        keys = default_jersey_keys(num_teams)
+        session['jersey_keys'] = keys
+    return keys
+
+def jersey_objects_for(num_teams):
+    keys = get_jersey_keys(num_teams)
+    return [JERSEY_BY_KEY.get(k) for k in keys]
+
 @app.route('/')
 def index():
     players = Player.query.order_by(Player.name).all()
@@ -905,28 +977,36 @@ def shuffle():
     session['team_ids'] = [[p.id for p in squad['players']] for squad in squad_packages]
     session['shuffle_selected_ids'] = player_ids
     session['shuffle_num_teams'] = num_teams
+    # Reset jersey colors to the default Red/Yellow/Blue order for a fresh
+    # shuffle (a brand new set of teams starts with the standard kit order).
+    session['jersey_keys'] = default_jersey_keys(num_teams)
 
     return render_template_string(
         HTML_TEMPLATE, view='results', teams=squad_packages,
-        selected_ids=player_ids, num_teams=num_teams, total_players=len(selected_players)
+        selected_ids=player_ids, num_teams=num_teams, total_players=len(selected_players),
+        jersey_colors=jersey_objects_for(num_teams), jersey_choices=JERSEY_CHOICES,
+        jersey_hex_map=JERSEY_HEX_MAP
     )
 
 @app.route('/results')
 def results():
-    # Lets a page refresh after dragging players around re-render the
-    # current (possibly swapped) board, instead of losing it.
+    # Lets a page refresh after dragging players around (or recoloring
+    # jerseys) re-render the current board, instead of losing it.
     team_ids = session.get('team_ids')
     if not team_ids:
         return redirect(url_for('index'))
 
     squad_packages = build_squad_packages_from_ids(team_ids)
     total_players = sum(len(s['players']) for s in squad_packages)
+    num_teams = session.get('shuffle_num_teams', len(team_ids))
 
     return render_template_string(
         HTML_TEMPLATE, view='results', teams=squad_packages,
         selected_ids=session.get('shuffle_selected_ids', []),
-        num_teams=session.get('shuffle_num_teams', len(team_ids)),
-        total_players=total_players
+        num_teams=num_teams,
+        total_players=total_players,
+        jersey_colors=jersey_objects_for(num_teams), jersey_choices=JERSEY_CHOICES,
+        jersey_hex_map=JERSEY_HEX_MAP
     )
 
 @app.route('/swap', methods=['POST'])
@@ -950,6 +1030,30 @@ def swap():
                 break
         team_ids[target_idx].append(player_id)
         session['team_ids'] = team_ids
+
+    return {'ok': True}
+
+@app.route('/jersey', methods=['POST'])
+def jersey():
+    team_ids = session.get('team_ids')
+    if not team_ids:
+        return {'ok': False, 'error': 'no active shuffle'}, 400
+
+    try:
+        team_idx = int(request.form.get('team_idx'))
+    except (TypeError, ValueError):
+        return {'ok': False, 'error': 'invalid team index'}, 400
+
+    color_key = request.form.get('color_key', '')
+    if color_key not in JERSEY_BY_KEY:
+        return {'ok': False, 'error': 'unknown color'}, 400
+    if not (0 <= team_idx < len(team_ids)):
+        return {'ok': False, 'error': 'invalid team index'}, 400
+
+    num_teams = session.get('shuffle_num_teams', len(team_ids))
+    keys = get_jersey_keys(num_teams)
+    keys[team_idx] = color_key
+    session['jersey_keys'] = keys
 
     return {'ok': True}
 

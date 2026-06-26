@@ -830,6 +830,7 @@ HTML_TEMPLATE = """
             <form action="/shuffle" method="POST" style="margin:0;">
                 <input type="hidden" name="num_teams" value="{{ num_teams }}">
                 {% for pid in selected_ids %}<input type="hidden" name="selected_players" value="{{ pid }}">{% endfor %}
+                {% if pairings %}{% for main_id, partner_id in pairings.items() %}<input type="hidden" name="pair_{{ main_id }}" value="{{ partner_id }}">{% endfor %}{% endif %}
                 <button type="submit" class="btn btn-dark">Reshuffle Same Players</button>
             </form>
             <a href="/" class="btn btn-ghost">← Edit check-in list</a>
@@ -1360,6 +1361,7 @@ def shuffle():
     return render_template_string(
         HTML_TEMPLATE, view='results', teams=squad_packages,
         selected_ids=player_ids, num_teams=num_teams, total_players=len(spots),
+        pairings={str(k): str(v) for k, v in pairings.items()},
         jersey_colors=jersey_objects_for(num_teams), jersey_choices=JERSEY_CHOICES,
         jersey_hex_map=JERSEY_HEX_MAP
     )
@@ -1381,6 +1383,7 @@ def results():
         selected_ids=session.get('shuffle_selected_ids', []),
         num_teams=num_teams,
         total_players=total_players,
+        pairings=session.get('shuffle_pairings', {}),
         jersey_colors=jersey_objects_for(num_teams), jersey_choices=JERSEY_CHOICES,
         jersey_hex_map=JERSEY_HEX_MAP
     )

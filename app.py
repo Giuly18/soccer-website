@@ -37,51 +37,237 @@ def keep_alive():
     return "I am awake", 200
 
 # --- BALANCING ALGORITHM (Now returns packaged Team dicts) ---
-def generate_fair_teams(selected_players, num_teams):
-    teams = [[] for _ in range(num_teams)]
-    gks = [p for p in selected_players if p.is_gk]
-    outfielders = [p for p in selected_players if not p.is_gk]
+# --- "SPOT" ABSTRACTION ---
+# A spot is one position on the field. It's either a single player, or a
+# rotating PAIR (a regular + their "+1") who share one spot and swap in/out
+# game to game. A pair occupies a single spot, and its skill is the AVERAGE
+# of the two players' skills (since only one of them is on the pitch at a
+# time and we don't know which in advance). Pairs are always outfield.
+#
+# spot_id encodes the makeup as a JSON-safe string so it can ride through
+# the session, drag/drop, and swaps as one atomic unit:
+#   "7"      -> single player with id 7
+#   "7+12"   -> pair: main player 7 rotating with +1 player 12
 
-    random.shuffle(gks)
-    for i, gk in enumerate(gks):
-        if i < num_teams: teams[i].append(gk)
+def make_spot(main_player, partner=None):
+    """Build a normalized spot dict from one or two Player rows."""
+    if partner is None:
+        return {
+            "spot_id": str(main_player.id),
+            "label": main_player.name,
+            "skill": main_player.skill,
+            "is_gk": main_player.is_gk,
+            "is_pair": False,
+        }
+    # Pair: averaged skill, both names, always outfield.
+    avg = (main_player.skill + partner.skill) / 2.0
+    return {
+        "spot_id": f"{main_player.id}+{partner.id}",
+        "label": f"{main_player.name} / {partner.name}",
+        "skill": avg,
+        "is_gk": False,
+        "is_pair": True,
+    }
 
-    random.shuffle(outfielders)
-    outfielders.sort(key=lambda x: x.skill, reverse=True)
+def spots_from_selection(selected_players, pairings):
+    """Turn a flat list of selected Player rows plus a pairings map
+    {main_id: partner_id} into a list of spots. The partner player is
+    folded into the main player's spot and does NOT get its own spot."""
+    by_id = {p.id: p for p in selected_players}
+    # Players who are someone's +1 don't occupy their own spot.
+    partner_ids = set(pairings.values())
 
-    max_cap = (len(selected_players) // num_teams) + (1 if len(selected_players) % num_teams != 0 else 0)
+    spots = []
+    for p in selected_players:
+        if p.id in partner_ids:
+            continue  # consumed as a partner in someone else's spot
+        partner = None
+        if p.id in pairings:
+            partner = by_id.get(pairings[p.id])
+        spots.append(make_spot(p, partner))
+    return spots
 
-    for player in outfielders:
-        eligible_teams = [i for i in range(num_teams) if len(teams[i]) < max_cap]
-        if not eligible_teams: eligible_teams = list(range(num_teams))
+def _sort_spots(spots):
+    # Goalkeepers first, then everyone else alphabetically by label.
+    return sorted(spots, key=lambda s: (not s["is_gk"], s["label"].lower()))
 
-        target_idx = min(eligible_teams, key=lambda i: sum(p.skill for p in teams[i] if not p.is_gk))
-        teams[target_idx].append(player)
+def _team_skill(team):
+    return sum(s["skill"] for s in team if not s["is_gk"])
 
-    # Pack each team into a dictionary containing its players AND its calculated sum.
-    # Within each squad: goalkeepers first, then outfielders alphabetically.
+def _spread(teams):
+    """How unbalanced a set of teams is: the gap between the strongest and
+    weakest team's total skill. Lower is better; 0 is perfectly even."""
+    totals = [_team_skill(t) for t in teams]
+    return max(totals) - min(totals)
+
+def _target_sizes(total_spots, num_teams):
+    """Even team sizes, e.g. 11 spots / 3 teams -> [4, 4, 3]."""
+    base = total_spots // num_teams
+    remainder = total_spots % num_teams
+    return [base + (1 if i < remainder else 0) for i in range(num_teams)]
+
+def _balance_once(field_pool, base_teams, target_field_sizes, rng):
+    """One randomized attempt: deal the field spots out randomly to hit the
+    target sizes, then do hill-climbing swaps/moves that lower the skill
+    spread without breaking the size targets. Returns (teams, spread)."""
+    num_teams = len(base_teams)
+    teams = [list(t) for t in base_teams]  # copy (keeps any GKs already placed)
+
+    # Random initial deal that respects the per-team field-spot quota.
+    shuffled = field_pool[:]
+    rng.shuffle(shuffled)
+    slots = []
+    for i, q in enumerate(target_field_sizes):
+        slots.extend([i] * q)
+    # slots is now e.g. [0,0,0,1,1,1,2,2] — assign in order to the shuffled pool
+    for spot, team_idx in zip(shuffled, slots):
+        teams[team_idx].append(spot)
+
+    # Hill climb: try swapping two field spots between teams, or moving one,
+    # whenever it reduces the spread. Moves must preserve team sizes, so only
+    # swaps (equal-size-preserving) are used here; sizes are already fixed by
+    # the initial deal.
+    def field_indices(team):
+        return [j for j, s in enumerate(team) if not s["is_gk"]]
+
+    improved = True
+    guard = 0
+    while improved and guard < 200:
+        improved = False
+        guard += 1
+        cur = _spread(teams)
+        if cur == 0:
+            break
+        # Try all pairwise team combinations, swapping one field spot each.
+        for a in range(num_teams):
+            for b in range(a + 1, num_teams):
+                a_fields = field_indices(teams[a])
+                b_fields = field_indices(teams[b])
+                best_swap = None
+                for ia in a_fields:
+                    for ib in b_fields:
+                        teams[a][ia], teams[b][ib] = teams[b][ib], teams[a][ia]
+                        new_spread = _spread(teams)
+                        teams[a][ia], teams[b][ib] = teams[b][ib], teams[a][ia]
+                        if new_spread < cur:
+                            if best_swap is None or new_spread < best_swap[0]:
+                                best_swap = (new_spread, ia, ib)
+                if best_swap:
+                    _, ia, ib = best_swap
+                    teams[a][ia], teams[b][ib] = teams[b][ib], teams[a][ia]
+                    cur = best_swap[0]
+                    improved = True
+
+    return teams, _spread(teams)
+
+def generate_fair_teams(spots, num_teams):
+    """Distribute spots (singles and pairs) across num_teams so that team
+    sizes are as even as possible and team skill totals are as close as
+    possible. Pairs count as one spot at their averaged skill.
+
+    Uses randomized local search with multiple restarts: it finds near-optimal
+    balanced splits, then picks at random among the equally-good ones — so the
+    teams are well balanced AND genuinely vary each time you reshuffle."""
+    teams_base = [[] for _ in range(num_teams)]
+    gk_spots = [s for s in spots if s["is_gk"]]
+    field_spots = [s for s in spots if not s["is_gk"]]
+
+    rng = random.Random()  # fresh randomness each call -> reshuffles differ
+
+    # One GK per team, round-robin. Extra GKs join the field pool (still
+    # tagged GK for display, but distributed like any other spot).
+    rng.shuffle(gk_spots)
+    extra_gks = []
+    for i, gk in enumerate(gk_spots):
+        if i < num_teams:
+            teams_base[i].append(gk)
+        else:
+            extra_gks.append(gk)
+
+    field_pool = field_spots + extra_gks
+
+    # Even team sizes overall. Subtract the GKs already placed so the field
+    # quota per team lands the TOTAL sizes even.
+    total_spots = len(spots)
+    target_total = _target_sizes(total_spots, num_teams)
+    # Randomize which team gets the "extra" spot when it doesn't divide evenly,
+    # so the larger team isn't always Team 1.
+    rng.shuffle(target_total)
+    target_field = [target_total[i] - len(teams_base[i]) for i in range(num_teams)]
+    # Guard against a GK-heavy edge case making a target negative.
+    target_field = [max(0, q) for q in target_field]
+    # If rounding/GK placement left the field quota not matching the pool size,
+    # nudge the largest quotas until they sum correctly.
+    diff = len(field_pool) - sum(target_field)
+    idx_order = sorted(range(num_teams), key=lambda i: target_field[i], reverse=(diff > 0))
+    k = 0
+    while diff != 0 and idx_order:
+        i = idx_order[k % num_teams]
+        if diff > 0:
+            target_field[i] += 1; diff -= 1
+        elif target_field[i] > 0:
+            target_field[i] -= 1; diff += 1
+        k += 1
+
+    # Multiple random restarts; collect the best spread and all results that
+    # tie (within a tiny tolerance) for it, then pick one at random for variety.
+    RESTARTS = 40
+    TOLERANCE = 0.5  # treat spreads within 0.5 of best as "equally good"
+    results = []
+    best_spread = None
+    for _ in range(RESTARTS):
+        teams, spread = _balance_once(field_pool, teams_base, target_field, rng)
+        results.append((spread, teams))
+        if best_spread is None or spread < best_spread:
+            best_spread = spread
+
+    near_best = [teams for spread, teams in results if spread <= best_spread + TOLERANCE]
+    chosen = rng.choice(near_best)
+
     squad_packages = []
-    for t in teams:
+    for t in chosen:
         squad_packages.append({
-            "players": sorted(t, key=lambda p: (not p.is_gk, p.name.lower())),
-            "total_skill": sum(p.skill for p in t if not p.is_gk)
+            "players": _sort_spots(t),
+            "total_skill": round(_team_skill(t), 1)
         })
 
     return squad_packages
 
-def build_squad_packages_from_ids(team_id_lists):
-    """Given a list of lists of player IDs (one list per team), fetch the
-    Player rows and rebuild the same squad package shape used by
+def spot_from_id(spot_id, players_by_id):
+    """Rebuild a spot dict from a spot_id string like '7' or '7+12'."""
+    if "+" in spot_id:
+        main_id_str, partner_id_str = spot_id.split("+", 1)
+        main = players_by_id.get(int(main_id_str))
+        partner = players_by_id.get(int(partner_id_str))
+        if main and partner:
+            return make_spot(main, partner)
+        # If one half is somehow missing, fall back to whichever exists.
+        if main:
+            return make_spot(main)
+        return None
+    p = players_by_id.get(int(spot_id))
+    return make_spot(p) if p else None
+
+def all_ids_in_spot_id(spot_id):
+    return [int(x) for x in spot_id.split("+")]
+
+def build_squad_packages_from_ids(team_spot_lists):
+    """Given a list of lists of spot_id strings (one list per team), fetch
+    the underlying Player rows and rebuild the squad package shape used by
     generate_fair_teams, preserving team order and recalculating totals."""
-    all_ids = [pid for team in team_id_lists for pid in team]
-    players_by_id = {p.id: p for p in Player.query.filter(Player.id.in_(all_ids)).all()}
+    all_player_ids = []
+    for team in team_spot_lists:
+        for spot_id in team:
+            all_player_ids.extend(all_ids_in_spot_id(spot_id))
+    players_by_id = {p.id: p for p in Player.query.filter(Player.id.in_(all_player_ids)).all()}
 
     squad_packages = []
-    for team_ids in team_id_lists:
-        team_players = [players_by_id[pid] for pid in team_ids if pid in players_by_id]
+    for team_spots in team_spot_lists:
+        spots = [spot_from_id(sid, players_by_id) for sid in team_spots]
+        spots = [s for s in spots if s is not None]
         squad_packages.append({
-            "players": sorted(team_players, key=lambda p: (not p.is_gk, p.name.lower())),
-            "total_skill": sum(p.skill for p in team_players if not p.is_gk)
+            "players": _sort_spots(spots),
+            "total_skill": round(sum(s["skill"] for s in spots if not s["is_gk"]), 1)
         })
     return squad_packages
 
@@ -243,14 +429,17 @@ HTML_TEMPLATE = """
         }
 
         .row {
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 13px 14px; border-bottom: 1px solid var(--paper-dim);
-            cursor: pointer; user-select: none; font-size: 0.96rem; font-weight: 600;
+            border-bottom: 1px solid var(--paper-dim);
+            user-select: none; font-size: 0.96rem; font-weight: 600;
             position: relative;
         }
         .row:last-child { border-bottom: none; }
-        .row:hover { background: #faf9f4; }
-        .row.checked { background: #EAF3EC; }
+        .row-main {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 13px 14px; cursor: pointer;
+        }
+        .row-main:hover { background: #faf9f4; }
+        .row.checked .row-main { background: #EAF3EC; }
         .row.checked .p-name::after { content: ''; }
 
         .check-mark {
@@ -266,6 +455,31 @@ HTML_TEMPLATE = """
         .row.checked .check-mark svg { opacity: 1; }
 
         .row-left { display: flex; align-items: center; gap: 12px; }
+        .row-right { display: flex; align-items: center; gap: 8px; }
+
+        /* --- +1 (rotating pair) control on the check-in page --- */
+        .plus-one-btn {
+            font-family: 'Teko', sans-serif; font-size: 0.85rem; font-weight: 700;
+            letter-spacing: 0.5px; color: var(--subink);
+            background: #ffffff; border: 1.5px solid var(--line); border-radius: 5px;
+            padding: 3px 9px; cursor: pointer; line-height: 1.2;
+        }
+        .plus-one-btn.active {
+            background: var(--pitch); color: #ffffff; border-color: var(--pitch);
+        }
+        .plus-one-tray {
+            display: flex; align-items: center; gap: 8px;
+            padding: 0 14px 12px 47px; background: #EAF3EC;
+        }
+        .plus-one-label {
+            font-size: 0.78rem; font-weight: 700; color: var(--subink); flex-shrink: 0;
+        }
+        .plus-one-select {
+            flex: 1; padding: 7px 8px; border: 1.5px solid var(--line); border-radius: 6px;
+            font-family: 'Inter', sans-serif; font-size: 0.85rem; font-weight: 600;
+            background: #ffffff; color: var(--ink); outline: none; min-width: 0;
+        }
+        .plus-one-select:focus { border-color: var(--pitch); }
 
         /* --- Badges (skill = admin only / GK always visible) --- */
         .sk-badge {
@@ -437,6 +651,12 @@ HTML_TEMPLATE = """
         }
         .drag-handle:active { cursor: grabbing; }
         .player-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .pair-tag {
+            display: inline-block; font-family: 'Teko', sans-serif; font-size: 0.62rem;
+            font-weight: 700; letter-spacing: 0.5px; vertical-align: 1px;
+            background: var(--pitch); color: #ffffff; border-radius: 4px;
+            padding: 1px 5px; margin-left: 2px;
+        }
 
         .drag-ghost {
             position: fixed; pointer-events: none; z-index: 999;
@@ -492,8 +712,8 @@ HTML_TEMPLATE = """
             <form action="/shuffle" method="POST" id="shuffle-form">
                 <span class="section-label">Match Format</span>
                 <select name="num_teams" id="num-teams-select" class="ui-input" onchange="updateCount()">
-                    <option value="3">3 Squads — 5-a-side rotation (needs 15)</option>
-                    <option value="2">2 Squads — Standard game (needs 10)</option>
+                    <option value="3">3 Squads</option>
+                    <option value="2">2 Squads</option>
                 </select>
 
                 <div class="top-row">
@@ -510,15 +730,35 @@ HTML_TEMPLATE = """
 
                 <div class="list-trap" id="roster-box">
                     {% for p in players %}
-                    <div class="row" onclick="toggleRow(this)">
-                        <div class="row-left">
-                            <div class="check-mark">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                    <div class="row check-row" data-player-id="{{ p.id }}" data-is-gk="{{ 'true' if p.is_gk else 'false' }}">
+                        <div class="row-main" onclick="toggleRow(this)">
+                            <div class="row-left">
+                                <div class="check-mark">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                                </div>
+                                <input type="checkbox" name="selected_players" value="{{ p.id }}" onchange="updateCount()" style="display:none;">
+                                <span class="p-name">{{ p.name }}</span>
                             </div>
-                            <input type="checkbox" name="selected_players" value="{{ p.id }}" onchange="updateCount()" style="display:none;">
-                            <span class="p-name">{{ p.name }}</span>
+                            <div class="row-right">
+                                {% if p.is_gk %}<span class="sk-badge sk-gk">GK</span>{% endif %}
+                                {% if not p.is_gk %}
+                                <button type="button" class="plus-one-btn" onclick="togglePlusOne(event, {{ p.id }})">+1</button>
+                                {% endif %}
+                            </div>
                         </div>
-                        {% if p.is_gk %}<span class="sk-badge sk-gk">GK</span>{% endif %}
+                        {% if not p.is_gk %}
+                        <div class="plus-one-tray" id="tray-{{ p.id }}" style="display:none;">
+                            <span class="plus-one-label">Rotates with:</span>
+                            <select class="plus-one-select" name="pair_{{ p.id }}" onchange="onPlusOneChange({{ p.id }})">
+                                <option value="">— none —</option>
+                                {% for o in players %}
+                                    {% if o.id != p.id and not o.is_gk %}
+                                    <option value="{{ o.id }}">{{ o.name }}</option>
+                                    {% endif %}
+                                {% endfor %}
+                            </select>
+                        </div>
+                        {% endif %}
                     </div>
                     {% endfor %}
                 </div>
@@ -562,12 +802,12 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="squad-list" data-team-idx="{{ this_team_idx }}">
                         {% for p in squad.players %}
-                        <div class="squad-player" draggable="true" data-player-id="{{ p.id }}" data-skill="{{ p.skill }}" data-gk="{{ 'true' if p.is_gk else 'false' }}">
+                        <div class="squad-player" draggable="true" data-player-id="{{ p.spot_id }}" data-skill="{{ p.skill }}" data-gk="{{ 'true' if p.is_gk else 'false' }}">
                             <div class="player-left">
                                 <svg class="drag-handle" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>
-                                <span class="player-name">{{ p.name }}{% if p.is_gk %} <span class="sk-badge sk-gk" style="font-size:0.6rem; vertical-align:1px;">GK</span>{% endif %}</span>
+                                <span class="player-name">{{ p.label }}{% if p.is_gk %} <span class="sk-badge sk-gk" style="font-size:0.6rem; vertical-align:1px;">GK</span>{% endif %}{% if p.is_pair %} <span class="pair-tag">+1</span>{% endif %}</span>
                             </div>
-                            <select class="swap-select" onchange="moveViaDropdown('{{ p.id }}', this.value); this.value='';">
+                            <select class="swap-select" onchange="moveViaDropdown('{{ p.spot_id }}', this.value); this.value='';">
                                 <option value="">Move...</option>
                                 {% for target_idx in range(teams|length) %}
                                     {% if target_idx != this_team_idx %}
@@ -579,7 +819,7 @@ HTML_TEMPLATE = """
                         {% endfor %}
                     </div>
                 </div>
-                <div class="squad-footer" id="count-{{ this_team_idx }}">{{ squad.players|length }} players</div>
+                <div class="squad-footer" id="count-{{ this_team_idx }}">{{ squad.players|length }} spots</div>
             </div>
             {% endfor %}
         </div>
@@ -660,7 +900,7 @@ HTML_TEMPLATE = """
 
         <div class="list-trap" id="admin-roster">
             {% for p in players %}
-            <div class="row" style="cursor:default;">
+            <div class="row" style="cursor:default; display:flex; justify-content:space-between; align-items:center; padding:13px 14px;">
                 <span class="p-name" style="font-weight:700;">{{ p.name }}</span>
                 <div style="display:flex; align-items:center; gap:12px;">
                     <form action="/admin/update/{{ p.id }}" method="POST" class="edit-form">
@@ -695,20 +935,82 @@ HTML_TEMPLATE = """
         // the main check-in page, where 0 players are selected at first).
         document.addEventListener('DOMContentLoaded', updateCount);
 
-        function toggleRow(el) {
-            const cb = el.querySelector('input[type="checkbox"]');
+        function toggleRow(rowMain) {
+            const row = rowMain.closest('.check-row');
+            const cb = rowMain.querySelector('input[type="checkbox"]');
             cb.checked = !cb.checked;
-            el.classList.toggle('checked', cb.checked);
+            row.classList.toggle('checked', cb.checked);
+            // If a player gets unchecked, collapse and clear any +1 they had.
+            if (!cb.checked) {
+                const tray = document.getElementById('tray-' + row.dataset.playerId);
+                const btn = rowMain.querySelector('.plus-one-btn');
+                if (tray) {
+                    const sel = tray.querySelector('.plus-one-select');
+                    if (sel) sel.value = '';
+                    tray.style.display = 'none';
+                }
+                if (btn) btn.classList.remove('active');
+            }
             updateCount();
         }
         function checkAll(state) {
-            document.querySelectorAll('#roster-box .row').forEach(row => {
+            document.querySelectorAll('#roster-box .check-row').forEach(row => {
                 const cb = row.querySelector('input[type="checkbox"]');
                 cb.checked = state;
-                state ? row.classList.add('checked') : row.classList.remove('checked');
+                row.classList.toggle('checked', state);
+                if (!state) {
+                    const tray = document.getElementById('tray-' + row.dataset.playerId);
+                    const btn = row.querySelector('.plus-one-btn');
+                    if (tray) {
+                        const sel = tray.querySelector('.plus-one-select');
+                        if (sel) sel.value = '';
+                        tray.style.display = 'none';
+                    }
+                    if (btn) btn.classList.remove('active');
+                }
             });
             updateCount();
         }
+
+        // Reveal/hide the "rotates with" dropdown for a player. Tapping +1
+        // also checks the player in (you can't bring a +1 if you're not
+        // playing), so the control always makes sense.
+        function togglePlusOne(event, playerId) {
+            event.stopPropagation();
+            const row = document.querySelector('.check-row[data-player-id="' + playerId + '"]');
+            const tray = document.getElementById('tray-' + playerId);
+            const btn = row.querySelector('.plus-one-btn');
+            const cb = row.querySelector('input[type="checkbox"]');
+            if (!tray) return;
+
+            const showing = tray.style.display !== 'none';
+            if (showing) {
+                tray.style.display = 'none';
+                btn.classList.remove('active');
+                const sel = tray.querySelector('.plus-one-select');
+                if (sel) sel.value = '';
+                updateCount();
+            } else {
+                // Opening the tray implies this player is in.
+                if (!cb.checked) {
+                    cb.checked = true;
+                    row.classList.add('checked');
+                }
+                tray.style.display = 'flex';
+                btn.classList.add('active');
+            }
+        }
+
+        function onPlusOneChange(playerId) {
+            const row = document.querySelector('.check-row[data-player-id="' + playerId + '"]');
+            const tray = document.getElementById('tray-' + playerId);
+            const btn = row.querySelector('.plus-one-btn');
+            const sel = tray.querySelector('.plus-one-select');
+            // Keep the +1 button highlighted only while a partner is chosen.
+            btn.classList.toggle('active', !!sel.value);
+            updateCount();
+        }
+
         function updateCount() {
             const display = document.getElementById('count-display');
             const warning = document.getElementById('count-warning');
@@ -716,34 +1018,55 @@ HTML_TEMPLATE = """
             const formatSelect = document.getElementById('num-teams-select');
             if (!display || !btn || !formatSelect) return;
 
-            const count = document.querySelectorAll('#roster-box input[type="checkbox"]:checked').length;
-            display.innerText = count + " checked in";
+            // Work out how many SPOTS are checked in. A rotating pair (a
+            // player with a chosen +1) is one spot, and the +1 partner does
+            // not also count as their own spot — mirroring the server.
+            const checkedIds = new Set();
+            document.querySelectorAll('#roster-box input[type="checkbox"]:checked').forEach(cb => {
+                checkedIds.add(cb.value);
+            });
 
-            // 2 squads need exactly 10 players (5v5), 3 squads need exactly
-            // 15 (5v5v5 rotation). Lock "Pick Teams" until the count matches.
-            const required = formatSelect.value === '2' ? 10 : 15;
+            const partnerIds = new Set();
+            document.querySelectorAll('#roster-box .plus-one-select').forEach(sel => {
+                const row = sel.closest('.check-row');
+                const mainId = row.dataset.playerId;
+                // Only counts if the main player is actually checked in and a
+                // valid partner is chosen.
+                if (sel.value && checkedIds.has(mainId)) {
+                    partnerIds.add(sel.value);
+                }
+            });
 
-            if (count === required) {
+            // Spots = checked players who are not consumed as someone's +1.
+            let spotCount = 0;
+            checkedIds.forEach(id => { if (!partnerIds.has(id)) spotCount += 1; });
+
+            const checkedTotal = checkedIds.size;
+            const pairCount = partnerIds.size;
+            let label = checkedTotal + " checked in";
+            if (pairCount > 0) label += " · " + spotCount + " spots";
+            display.innerText = label;
+
+            const numTeams = parseInt(formatSelect.value, 10);
+            if (spotCount >= numTeams) {
                 btn.disabled = false;
                 warning.classList.remove('show');
                 warning.innerText = '';
             } else {
                 btn.disabled = true;
-                const diff = required - count;
+                const diff = numTeams - spotCount;
                 warning.classList.add('show');
-                if (diff > 0) {
-                    warning.innerText = `Need ${diff} more player${diff === 1 ? '' : 's'} (${required} required for this format)`;
-                } else {
-                    warning.innerText = `${-diff} too many (${required} required for this format)`;
-                }
+                warning.innerText = `Need at least ${numTeams} spots for ${numTeams} squads — add ${diff} more`;
             }
         }
         function filterUI(inputEl, boxId) {
             const query = inputEl.value.toLowerCase();
             const rows = document.getElementById(boxId).getElementsByClassName('row');
             for (let row of rows) {
-                const name = row.getElementsByClassName('p-name')[0].innerText.toLowerCase();
-                row.style.display = name.includes(query) ? "flex" : "none";
+                const nameEl = row.getElementsByClassName('p-name')[0];
+                if (!nameEl) continue;
+                const name = nameEl.innerText.toLowerCase();
+                row.style.display = name.includes(query) ? "" : "none";
             }
         }
 
@@ -815,7 +1138,7 @@ HTML_TEMPLATE = """
                 const ratingEl = document.getElementById('rating-' + teamIdx);
                 const countEl = document.getElementById('count-' + teamIdx);
                 if (ratingEl) ratingEl.innerText = 'Rating ' + total;
-                if (countEl) countEl.innerText = players.length + (players.length === 1 ? ' player' : ' players');
+                if (countEl) countEl.innerText = players.length + (players.length === 1 ? ' spot' : ' spots');
             }
 
             function movePlayerTo(playerEl, targetList) {
@@ -917,7 +1240,7 @@ HTML_TEMPLATE = """
                 let total = 0;
                 players.forEach(p => { if (p.dataset.gk !== 'true') total += parseInt(p.dataset.skill || '0', 10); });
                 document.getElementById('rating-' + idx).innerText = 'Rating ' + total;
-                document.getElementById('count-' + idx).innerText = players.length + (players.length === 1 ? ' player' : ' players');
+                document.getElementById('count-' + idx).innerText = players.length + (players.length === 1 ? ' spot' : ' spots');
             };
             recalc(fromIdx);
             recalc(targetIdx);
@@ -933,8 +1256,6 @@ HTML_TEMPLATE = """
 """
 
 # --- ROUTING CONTROLLERS ---
-
-REQUIRED_PLAYERS_BY_FORMAT = {2: 10, 3: 15}
 
 # Jersey color palette: default order is Team 1 = Red, Team 2 = Yellow,
 # Team 3 = Blue. Swappable per-team via the dropdown on the results page.
@@ -977,25 +1298,60 @@ def shuffle():
     num_teams = int(request.form.get('num_teams', 3))
     if not player_ids: return redirect(url_for('index'))
 
-    # Defensive server-side check: the check-in page already locks the
-    # button until the count matches, but this guards against a direct
-    # POST that skips the UI (devtools, stale page, etc).
-    required = REQUIRED_PLAYERS_BY_FORMAT.get(num_teams)
-    if required is not None and len(player_ids) != required:
-        diff = required - len(player_ids)
-        if diff > 0:
-            msg = f"Need {diff} more player{'s' if diff != 1 else ''} — {required} required for {num_teams} squads."
-        else:
-            msg = f"{-diff} too many — {required} required for {num_teams} squads."
+    selected_players = Player.query.filter(Player.id.in_(player_ids)).all()
+
+    # Parse +1 pairings from the form. Each checked-in player can optionally
+    # bring a "+1" who is another player in the roster; the pair shares one
+    # spot on the field and rotates game to game. Form fields look like
+    # pair_<mainId> = <partnerId>. We validate each pairing so a stray or
+    # malformed value can't break team generation:
+    #   - main player must actually be checked in
+    #   - partner must be a real, checked-in player, different from main
+    #   - neither main nor partner may be a goalkeeper (pairs are outfield)
+    #   - a player can't be in more than one pairing
+    selected_id_set = {p.id for p in selected_players}
+    players_by_id = {p.id: p for p in selected_players}
+    pairings = {}
+    claimed = set()  # ids already used as a main or partner in some pairing
+
+    for key, value in request.form.items():
+        if not key.startswith('pair_'):
+            continue
+        if not value:
+            continue
+        try:
+            main_id = int(key[len('pair_'):])
+            partner_id = int(value)
+        except ValueError:
+            continue
+        if main_id == partner_id:
+            continue
+        if main_id not in selected_id_set or partner_id not in selected_id_set:
+            continue
+        if main_id in claimed or partner_id in claimed:
+            continue
+        if players_by_id[main_id].is_gk or players_by_id[partner_id].is_gk:
+            continue  # pairs are outfield-only
+        pairings[main_id] = partner_id
+        claimed.add(main_id)
+        claimed.add(partner_id)
+
+    spots = spots_from_selection(selected_players, pairings)
+
+    # The real floor is one spot per team — a pair counts as a single spot,
+    # so this is checked on spot count, not raw headcount.
+    if len(spots) < num_teams:
+        msg = f"Need at least {num_teams} spots to make {num_teams} squads (only {len(spots)} after pairing)."
         return redirect(url_for('index', error=msg))
 
-    selected_players = Player.query.filter(Player.id.in_(player_ids)).all()
-    squad_packages = generate_fair_teams(selected_players, num_teams)
+    squad_packages = generate_fair_teams(spots, num_teams)
 
-    # Store just the team id-structure in session, so manual swaps and
-    # reshuffles can both work from a single source of truth.
-    session['team_ids'] = [[p.id for p in squad['players']] for squad in squad_packages]
+    # Store the team spot-id structure in session, so manual swaps and
+    # reshuffles can both work from a single source of truth. spot_ids are
+    # strings like "7" or "7+12" so pairs travel as one unit.
+    session['team_ids'] = [[s['spot_id'] for s in squad['players']] for squad in squad_packages]
     session['shuffle_selected_ids'] = player_ids
+    session['shuffle_pairings'] = {str(k): str(v) for k, v in pairings.items()}
     session['shuffle_num_teams'] = num_teams
     # Reset jersey colors to the default Red/Yellow/Blue order for a fresh
     # shuffle (a brand new set of teams starts with the standard kit order).
@@ -1003,7 +1359,7 @@ def shuffle():
 
     return render_template_string(
         HTML_TEMPLATE, view='results', teams=squad_packages,
-        selected_ids=player_ids, num_teams=num_teams, total_players=len(selected_players),
+        selected_ids=player_ids, num_teams=num_teams, total_players=len(spots),
         jersey_colors=jersey_objects_for(num_teams), jersey_choices=JERSEY_CHOICES,
         jersey_hex_map=JERSEY_HEX_MAP
     )
@@ -1035,20 +1391,25 @@ def swap():
     if not team_ids:
         return {'ok': False, 'error': 'no active shuffle'}, 400
 
-    player_id = int(request.form.get('player_id'))
+    # player_id here is really a spot_id string ("7" or "7+12"), kept opaque
+    # so a rotating pair moves between teams as one unit.
+    spot_id = request.form.get('player_id', '')
     target_team = request.form.get('target_team')
 
-    if target_team != '':
-        target_idx = int(target_team)
+    if spot_id and target_team != '':
+        try:
+            target_idx = int(target_team)
+        except (TypeError, ValueError):
+            return {'ok': False, 'error': 'invalid team index'}, 400
         if not (0 <= target_idx < len(team_ids)):
             return {'ok': False, 'error': 'invalid team index'}, 400
-        # Remove the player from whichever team currently holds them, then
-        # add them to the chosen team. No-op safely if already there.
+        # Remove the spot from whichever team currently holds it, then add
+        # it to the chosen team. No-op safely if already there.
         for team in team_ids:
-            if player_id in team:
-                team.remove(player_id)
+            if spot_id in team:
+                team.remove(spot_id)
                 break
-        team_ids[target_idx].append(player_id)
+        team_ids[target_idx].append(spot_id)
         session['team_ids'] = team_ids
 
     return {'ok': True}

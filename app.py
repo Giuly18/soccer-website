@@ -632,6 +632,14 @@ HTML_TEMPLATE = """
         }
         .mini-select.skill-select { width: 56px; text-align: center; }
 
+        .saved-dot {
+            font-family: 'Inter', sans-serif; font-size: 0.68rem; font-weight: 700;
+            color: var(--pitch); white-space: nowrap;
+            opacity: 0; transform: translateX(4px);
+            transition: opacity 0.15s, transform 0.15s; pointer-events: none;
+        }
+        .saved-dot.show { opacity: 1; transform: translateX(0); }
+
         /* --- Results: drag-and-drop + swap controls --- */
         .squad-list { min-height: 12px; }
         .squad-player {
@@ -904,15 +912,16 @@ HTML_TEMPLATE = """
             <div class="row" style="cursor:default; display:flex; justify-content:space-between; align-items:center; padding:13px 14px;">
                 <span class="p-name" style="font-weight:700;">{{ p.name }}</span>
                 <div style="display:flex; align-items:center; gap:12px;">
-                    <form action="/admin/update/{{ p.id }}" method="POST" class="edit-form">
-                        <select name="is_gk" class="mini-select" onchange="this.form.submit()">
+                    <span class="saved-dot" id="saved-{{ p.id }}">saved ✓</span>
+                    <form action="/admin/update/{{ p.id }}" method="POST" class="edit-form" id="edit-form-{{ p.id }}">
+                        <select name="is_gk" class="mini-select" onchange="savePlayer({{ p.id }})">
                             <option value="false" {% if not p.is_gk %}selected{% endif %}>OUT</option>
                             <option value="true" {% if p.is_gk %}selected{% endif %}>GK</option>
                         </select>
                         <select name="skill" class="mini-select skill-select"
                                 style="background-color:{{ skill_color(p.skill) }}; color:{{ skill_text_color(p.skill) }}; border-color:{{ skill_color(p.skill) }}; font-weight:800;"
                                 data-textcolor="{{ skill_text_color(p.skill) }}"
-                                onchange="this.style.backgroundColor=this.options[this.selectedIndex].dataset.color; this.style.borderColor=this.options[this.selectedIndex].dataset.color; this.style.color=this.options[this.selectedIndex].dataset.textcolor; this.form.submit();"
+                                onchange="savePlayer({{ p.id }})"
                                 {% if p.is_gk %}disabled{% endif %}>
                             {% for s in range(1, 11) %}
                             <option value="{{ s }}" data-color="{{ skill_color(s) }}" data-textcolor="{{ skill_text_color(s) }}" style="background-color:{{ skill_color(s) }}; color:{{ skill_text_color(s) }};" {% if p.skill == s %}selected{% endif %}>{{ s }}</option>
@@ -1069,6 +1078,50 @@ HTML_TEMPLATE = """
                 const name = nameEl.innerText.toLowerCase();
                 row.style.display = name.includes(query) ? "" : "none";
             }
+        }
+
+        // --- Admin: save player edits in the background (no page reload) ---
+        // Keeps you scrolled where you are while editing several players in a
+        // row, instead of submitting the form and jumping back to the top.
+        function savePlayer(playerId) {
+            const form = document.getElementById('edit-form-' + playerId);
+            if (!form) return;
+            const posSel = form.querySelector('select[name="is_gk"]');
+            const skillSel = form.querySelector('select[name="skill"]');
+            const isGk = posSel.value === 'true';
+
+            // Goalkeepers don't use an outfield skill, so grey the skill
+            // picker out — but keep its value so flipping back to Outfield
+            // restores the rating.
+            skillSel.disabled = isGk;
+
+            // Refresh the skill swatch colors from the chosen option.
+            const opt = skillSel.options[skillSel.selectedIndex];
+            if (opt && opt.dataset.color) {
+                skillSel.style.backgroundColor = opt.dataset.color;
+                skillSel.style.borderColor = opt.dataset.color;
+                skillSel.style.color = opt.dataset.textcolor;
+            }
+
+            const fd = new FormData();
+            fd.append('is_gk', posSel.value);
+            fd.append('skill', skillSel.value);
+
+            fetch(form.action, {
+                method: 'POST',
+                headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                body: fd
+            }).then(r => {
+                if (r.ok) flashSaved(playerId);
+            }).catch(() => {});
+        }
+
+        function flashSaved(playerId) {
+            const dot = document.getElementById('saved-' + playerId);
+            if (!dot) return;
+            dot.classList.add('show');
+            clearTimeout(dot._t);
+            dot._t = setTimeout(() => dot.classList.remove('show'), 1100);
         }
 
         // --- Jersey color selection (results page) ---
@@ -1481,7 +1534,11 @@ def admin_delete(player_id):
 
 @app.route('/admin/update/<int:player_id>', methods=['POST'])
 def admin_update(player_id):
-    if not session.get('admin_unlocked'): return redirect(url_for('admin'))
+    is_ajax = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+    if not session.get('admin_unlocked'):
+        if is_ajax:
+            return {'ok': False, 'error': 'not authorized'}, 403
+        return redirect(url_for('admin'))
     p = Player.query.get(player_id)
     if p:
         p.is_gk = (request.form.get('is_gk') == 'true')
@@ -1492,6 +1549,11 @@ def admin_update(player_id):
         if skill_raw is not None:
             p.skill = int(skill_raw)
         db.session.commit()
+    # Background saves (the admin page's dropdowns) get a tiny JSON ack so
+    # the page doesn't reload and jump back to the top. Plain form posts
+    # (no JS) still fall back to a normal redirect.
+    if is_ajax:
+        return {'ok': True}
     return redirect(url_for('admin'))
 
 if __name__ == '__main__':
